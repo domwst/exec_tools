@@ -17,11 +17,47 @@ using namespace std::chrono_literals;
 enum CompilationStatus {
   InProgress,
   MemoryLimit,
-  TimeLimit,
+  WallTimeLimit,
+  CpuTimeLimit,
   Finished,
 };
 
-constexpr uint64_t memoryLimit = 3ull << 30;
+std::string_view ToString(CompilationStatus status) {
+  switch(status) {
+    case InProgress:
+      return "";
+    case MemoryLimit:
+      return "ML";
+    case CpuTimeLimit:
+      return "TL";
+    case WallTimeLimit:
+      return "WT";
+    case Finished:
+      return "OK";
+  }
+}
+
+std::string ToString(sex::util::ExitStatus status) {
+  switch (status.getType()) {
+    case sex::util::ExitStatus::Type::Exited:
+      return std::string() + "exited " + std::to_string(status.getExitCode());
+    case sex::util::ExitStatus::Type::Signaled:
+      return std::string() + "signaled " + std::to_string(status.getSignal());
+  }
+}
+
+constexpr uint64_t memoryLimit = 256 << 20; // 256Mb
+constexpr auto wallTimeLimit = 10s;
+constexpr auto cpuTimeLimit = 9s;
+
+
+struct RunStatistics {
+  std::chrono::microseconds wallTime{};
+  sex::CgroupController::CpuUsage cpuTime{};
+  uint64_t maxMemoryBytes{};
+  sex::util::ExitStatus exitStatus;
+  CompilationStatus status{};
+};
 
 void Proxy(
   sex::Container& c,
@@ -65,9 +101,9 @@ void Proxy(
   pid.send(compilation.getPid()).ensure();
 
   sex::util::TimerFd statusCheck;
-  statusCheck.set(20ms, 20ms);
+  statusCheck.set(10ms, 10ms);
   sex::util::TimerFd deadline;
-  deadline.set(10s);
+  deadline.set(wallTimeLimit);
 
   enum Event : uintptr_t {
     StatusCheck,
@@ -80,6 +116,8 @@ void Proxy(
   eventPoller.Add(deadline, (void*)Deadline, sex::util::EventPoller::IN);
   eventPoller.Add(compilation.getPidFd(), (void*)FinishedProc, sex::util::EventPoller::IN);
 
+  uint64_t maxMemoryBytes = 0;
+
   CompilationStatus currentStatus = InProgress;
   while (currentStatus == InProgress) {
     sex::util::EventPoller::Event ev{};
@@ -87,38 +125,51 @@ void Proxy(
     switch ((Event)(uintptr_t)ev.cookie) {
       case StatusCheck: {
         auto mem = cctl.getCurrentMemory();
-        if (mem > memoryLimit) {
+        if (mem > maxMemoryBytes) {
+          maxMemoryBytes = mem;
+        }
+        if (maxMemoryBytes > memoryLimit) {
           currentStatus = MemoryLimit;
         }
+
+        auto cpu = cctl.getCpuUsage().total;
+        if (cpu > cpuTimeLimit) {
+          currentStatus = CpuTimeLimit;
+        }
+
         statusCheck.wait();
-        std::cout << "Status check, mem=" << mem << std::endl;
         break;
       }
 
       case Deadline:
-        currentStatus = TimeLimit;
+        currentStatus = WallTimeLimit;
         deadline.wait();
-        std::cerr << "Deadline" << std::endl;
         break;
 
       case FinishedProc:
         currentStatus = Finished;
-        std::cerr << "Process is finished" << std::endl;
         break;
     }
   }
-  compilation.sendSignal(SIGKILL).ensure();
+  auto timeSpent = wallTimeLimit - deadline.cancel().first_expiration;
+  cctl.killAll();
 
   auto s = std::move(compilation).wait();
 
-  std::cout << "Waited for process" << std::endl;
+  RunStatistics statistics{
+    .wallTime = std::chrono::duration_cast<std::chrono::microseconds>(timeSpent),
+    .cpuTime = cctl.getCpuUsage(),
+    .maxMemoryBytes = maxMemoryBytes,
+    .exitStatus = s,
+    .status = currentStatus,
+  };
 
-  status.send(currentStatus).ensure();
-  if (currentStatus != Finished) return;
-  status.send(s).ensure();
+  status.send(statistics).ensure();
 
   if (s == sex::util::ExitStatus::Exited(0)) {
     std::ofstream(destination) << std::ifstream(c.getPath() / "output").rdbuf();  // TODO: check for errors
+    fs::permissions(destination, fs::perms::owner_exec | fs::perms::group_exec | fs::perms::others_exec,
+                    fs::perm_options::add);
   }
 }
 
@@ -136,8 +187,9 @@ int main(int argc, char *argv[]) {
     "clang_compile_" + std::to_string(getpid()),
     sex::CgroupController::Builder{}
       .setPidsLimit(10)
-      .setMemoryLimitHigh(memoryLimit)  // 256Mb
+      .setMemoryLimitHigh(memoryLimit)
       .setMemoryLimitMax(memoryLimit * 3 / 2)
+      .setCpuWindowLimit(100ms, 100ms)
   );
 
   sex::util::DataTransfer start;
@@ -165,28 +217,13 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  auto execStatus = status.receive<CompilationStatus>().unwrap();
+  auto statistics = status.receive<RunStatistics>().unwrap();
 
-  switch (execStatus) {
-    case CompilationStatus::TimeLimit:
-      std::cerr << "Time limit exceeded" << std::endl;
-      break;
-
-    case CompilationStatus::MemoryLimit:
-      std::cerr << "Memory limit exceeded" << std::endl;
-      break;
-
-    case CompilationStatus::Finished: {
-      auto s = status.receive<sex::util::ExitStatus>().unwrap();
-      if (s.isExited()) {
-        std::cerr << "Clang finished with exit code " << s.getExitCode() << std::endl;
-      } else {
-        std::cerr << "Clang was killed by signal #" << s.getSignal() << std::endl;
-      }
-      break;
-    }
-
-    case CompilationStatus::InProgress:
-      SEX_ASSERT(false);
-  }
+  std::cout << "time.wall: " << statistics.wallTime.count() << "\n";
+  std::cout << "time.cpu.total: " << statistics.cpuTime.total.count() << "\n";
+  std::cout << "time.cpu.user: " << statistics.cpuTime.user.count() << "\n";
+  std::cout << "time.cpu.system: " << statistics.cpuTime.system.count() << "\n";
+  std::cout << "memory.max: " << statistics.maxMemoryBytes << "\n";
+  std::cout << "status: " << ToString(statistics.exitStatus) << "\n";
+  std::cout << "verdict: " << ToString(statistics.status) << "\n";
 }
